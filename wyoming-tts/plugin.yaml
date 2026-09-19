@@ -1,0 +1,4 @@
+name: wyoming-tts
+version: 0.1.0
+description: "Streaming TTS from any Wyoming server (Piper, Pocket TTS, ...): speech starts on the first audio chunk of each clause instead of after a whole file. Per-clause fallback to your normal TTS provider."
+author: "Drew Lawton"
