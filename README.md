@@ -41,8 +41,9 @@ Keep your normal `tts.provider` as it is. It still handles whole-file speech (vo
 
 | Key | Default | Meaning |
 |---|---|---|
-| `host` | env `WYOMING_TTS_HOST` | Wyoming server. Required; the plugin stays inactive without it. |
-| `port` | `10200` (env `WYOMING_TTS_PORT`) | Wyoming TCP port. |
+| `uri` | env `WYOMING_TTS_URI` | Server address as `tcp://host:port` or `unix:///path/to.sock`. Takes precedence over `host`/`port`. |
+| `host` | env `WYOMING_TTS_HOST` | TCP server host. Either `uri` or `host` is required; the plugin stays inactive without one. |
+| `port` | `10200` (env `WYOMING_TTS_PORT`) | TCP port, used with `host`. |
 | `voice` | env `WYOMING_TTS_VOICE`, else the `voice` of your active `tts.provider` | Voice name sent to the server. |
 | `speaker` | none | Speaker id for multi-speaker voices. |
 | `language` | none | Language hint. |
@@ -51,6 +52,15 @@ Keep your normal `tts.provider` as it is. It still handles whole-file speech (vo
 | `read_timeout` | `15.0` | Longest allowed silence between audio events. |
 | `fallback` | `provider` | `provider`: speak the clause through your normal `tts.provider`. `none`: fail and let Hermes handle it. |
 | `retry_after` | `30` | After a failure, skip the server for this many seconds so each clause doesn't wait out the timeout again. `0` disables this. |
+| `check_voice` | `true` | On first use, ask the server for its voice list and log a warning if `voice` isn't on it. Some servers (Pocket TTS among them) silently fall back to a default voice for unknown names, so this is the only place a typo shows up. Runs in the background and never delays speech. |
+
+For a server on the same machine, a Unix socket skips TCP entirely:
+
+```yaml
+tts:
+  wyoming:
+    uri: unix:///run/wyoming-piper.sock
+```
 
 ## Failure behaviour
 
@@ -78,8 +88,17 @@ python tests/test_plugin.py
 ```
 
 These run against an in-process fake Wyoming server and cover normal streaming, old-style inline
-headers, stalls, mid-stream drops, server errors, fallback, the retry cooldown, barge-in and
-resampling. Hermes isn't needed; PyAV is needed only for the resampling test.
+headers, stalls, mid-stream drops, server errors, fallback, the retry cooldown, barge-in,
+resampling, Unix sockets, address parsing and the voice check. Hermes isn't needed; PyAV is needed
+only for the resampling test, and the Unix-socket test is skipped where the platform lacks them.
+
+## Protocol coverage
+
+This is a Wyoming **TTS client**, not a full Wyoming implementation. It speaks `synthesize`,
+`audio-start`/`audio-chunk`/`audio-stop`, `error`, and `describe`/`info` (for the voice check),
+over TCP or Unix sockets. It doesn't implement streaming text input (`synthesize-start`/`-chunk`/
+`-stop`), speech-to-text, wake word, VAD, intents, satellites, stdio transport or Zeroconf
+discovery.
 
 ## Deploy script
 

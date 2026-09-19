@@ -27,11 +27,12 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional
 
-from .protocol import PcmFormat, Synthesis, WyomingError
+from .protocol import Address, PcmFormat, Synthesis, WyomingError, describe, tts_voice_names
 
 logger = logging.getLogger("wyoming_tts")
 
@@ -62,8 +63,7 @@ def _inherited_voice(tts_config: Dict) -> Optional[str]:
 
 @dataclass
 class Options:
-    host: Optional[str]
-    port: int = 10200
+    address: Optional[Address]
     voice: Optional[str] = None
     speaker: Optional[str] = None
     language: Optional[str] = None
@@ -72,6 +72,19 @@ class Options:
     read_timeout: float = 15.0
     fallback: str = "provider"
     retry_after: float = 30.0
+    check_voice: bool = True
+
+    @staticmethod
+    def _address(sec: Dict) -> Optional[Address]:
+        """``uri`` (tcp://host:port or unix:///path) wins; else ``host`` + ``port``; else env."""
+        env = os.environ.get
+        uri = _str(sec.get("uri")) or _str(env("WYOMING_TTS_URI"))
+        if uri:
+            return Address.parse(uri)
+        host = _str(sec.get("host")) or _str(env("WYOMING_TTS_HOST"))
+        if not host:
+            return None
+        return Address("tcp", host=host, port=int(sec.get("port") or env("WYOMING_TTS_PORT") or 10200))
 
     @classmethod
     def from_config(cls, tts_config: Dict, section: Optional[Dict] = None) -> "Options":
@@ -81,9 +94,13 @@ class Options:
         if fallback not in _FALLBACK_MODES:
             logger.warning("wyoming-tts: unknown fallback %r, using 'provider'", fallback)
             fallback = "provider"
+        try:
+            address = cls._address(sec)
+        except ValueError as exc:
+            logger.warning("wyoming-tts: %s; plugin inactive", exc)
+            address = None
         return cls(
-            host=_str(sec.get("host")) or _str(env("WYOMING_TTS_HOST")),
-            port=int(sec.get("port") or env("WYOMING_TTS_PORT") or 10200),
+            address=address,
             voice=(_str(sec.get("voice")) or _str(env("WYOMING_TTS_VOICE"))
                    or _inherited_voice(tts_config)),
             speaker=_str(sec.get("speaker")),
@@ -93,7 +110,46 @@ class Options:
             read_timeout=float(sec.get("read_timeout") or 15.0),
             fallback=fallback,
             retry_after=float(sec.get("retry_after", 30.0)),
+            check_voice=bool(sec.get("check_voice", True)),
         )
+
+
+# One describe per (server, voice) per process. Wyoming servers may substitute a default voice for
+# an unknown name without any error (Pocket TTS does), so this is the only place a typo surfaces.
+_voice_checks: set = set()
+_voice_checks_lock = threading.Lock()
+
+
+def check_voice_once(opts: Options, *, blocking: bool = False) -> None:
+    if not (opts.check_voice and opts.voice and opts.address):
+        return
+    key = (str(opts.address), opts.voice)
+    with _voice_checks_lock:
+        if key in _voice_checks:
+            return
+        _voice_checks.add(key)
+
+    def run() -> None:
+        try:
+            names = tts_voice_names(describe(opts.address, timeout=max(opts.connect_timeout, 5.0)))
+        except Exception as exc:  # server down etc.: let a later clause retry the check
+            with _voice_checks_lock:
+                _voice_checks.discard(key)
+            logger.debug("wyoming-tts: voice check skipped (%s)", exc)
+            return
+        if not names:
+            logger.info("wyoming-tts: %s lists no voices; cannot check %r", opts.address, opts.voice)
+        elif opts.voice in names:
+            logger.info("wyoming-tts: voice %r confirmed on %s", opts.voice, opts.address)
+        else:
+            logger.warning("wyoming-tts: voice %r is NOT advertised by %s; the server may silently use "
+                           "its default voice. Available: %s", opts.voice, opts.address,
+                           ", ".join(sorted(names)[:40]))
+
+    if blocking:
+        run()
+    else:
+        threading.Thread(target=run, name="wyoming-tts-voice-check", daemon=True).start()
 
 
 class PcmConverter:
@@ -160,7 +216,7 @@ def build_streamer(ts) -> type:
         @staticmethod
         def available() -> bool:
             try:
-                return bool(Options.from_config(ts._load_tts_config()).host)
+                return Options.from_config(ts._load_tts_config()).address is not None
             except Exception:  # pragma: no cover - config unreadable
                 return False
 
@@ -170,7 +226,8 @@ def build_streamer(ts) -> type:
                 return
             opts = self.options
             cls = type(self)
-            if opts.host and time.monotonic() >= cls._down_until:
+            check_voice_once(opts)
+            if opts.address and time.monotonic() >= cls._down_until:
                 yielded = False
                 try:
                     for chunk in self._wyoming(text):
@@ -184,8 +241,8 @@ def build_streamer(ts) -> type:
                         cls._down_until = time.monotonic() + opts.retry_after
                     if opts.fallback == "none":
                         raise
-                    logger.warning("wyoming-tts: %s:%s unavailable (%s); using fallback for %.0fs",
-                                   opts.host, opts.port, exc, opts.retry_after)
+                    logger.warning("wyoming-tts: %s unavailable (%s); using fallback for %.0fs",
+                                   opts.address, exc, opts.retry_after)
             elif opts.fallback == "none":
                 raise WyomingError("wyoming server marked down; fallback disabled")
             yield from self._fallback(text)
@@ -196,7 +253,7 @@ def build_streamer(ts) -> type:
             first = None
             total = 0
             converter: Optional[PcmConverter] = None
-            with Synthesis(opts.host, opts.port, text, voice=opts.voice, speaker=opts.speaker,
+            with Synthesis(opts.address, text, voice=opts.voice, speaker=opts.speaker,
                            language=opts.language, connect_timeout=opts.connect_timeout,
                            read_timeout=opts.read_timeout) as synth:
                 for pcm in synth:

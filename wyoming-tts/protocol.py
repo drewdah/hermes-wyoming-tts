@@ -1,6 +1,6 @@
-"""Minimal, dependency-free Wyoming TTS client.
+"""Minimal, dependency-free Wyoming TTS client (TCP or Unix socket).
 
-Wyoming is a JSONL-framed TCP protocol: each event is one JSON header line
+Wyoming is a JSONL-framed stream protocol: each event is one JSON header line
 (``type``, ``data_length``, ``payload_length``), then ``data_length`` bytes of
 JSON data, then ``payload_length`` bytes of binary payload. Older servers put
 ``data`` inline in the header; both forms are accepted here.
@@ -31,6 +31,49 @@ class PcmFormat:
     rate: int
     width: int  # bytes per sample
     channels: int
+
+
+@dataclass(frozen=True)
+class Address:
+    """Where a Wyoming server listens: ``tcp://host:port`` or ``unix:///path/to.sock``."""
+
+    scheme: str  # "tcp" | "unix"
+    host: str = ""
+    port: int = 0
+    path: str = ""
+
+    def __str__(self) -> str:
+        return f"unix://{self.path}" if self.scheme == "unix" else f"tcp://{self.host}:{self.port}"
+
+    @classmethod
+    def parse(cls, uri: str, default_port: int = 10200) -> "Address":
+        uri = uri.strip()
+        if uri.startswith("unix://"):
+            path = uri[len("unix://"):]
+            if not path:
+                raise ValueError(f"unix URI needs a socket path: {uri!r}")
+            return cls("unix", path=path)
+        rest = uri[len("tcp://"):] if uri.startswith("tcp://") else uri
+        if "://" in rest:
+            raise ValueError(f"unsupported Wyoming URI scheme: {uri!r} (use tcp:// or unix://)")
+        host, sep, port = rest.rpartition(":")
+        if not sep or not port.isdigit():  # bare host (or IPv6 without port)
+            host, port = rest, str(default_port)
+        return cls("tcp", host=host.strip("[]"), port=int(port))
+
+    def connect(self, timeout: float) -> socket.socket:
+        if self.scheme == "unix":
+            if not hasattr(socket, "AF_UNIX"):
+                raise WyomingError("unix sockets are not supported on this platform")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                sock.connect(self.path)
+            except BaseException:
+                sock.close()
+                raise
+            return sock
+        return socket.create_connection((self.host, self.port), timeout=timeout)
 
 
 def write_event(sock: socket.socket, etype: str, data: Optional[dict] = None, payload: bytes = b"") -> None:
@@ -79,10 +122,10 @@ class Synthesis:
     ``format`` is known once the first ``audio-start``/``audio-chunk`` has arrived.
     """
 
-    def __init__(self, host: str, port: int, text: str, *, voice: Optional[str] = None,
+    def __init__(self, address: Address, text: str, *, voice: Optional[str] = None,
                  speaker: Optional[str] = None, language: Optional[str] = None,
                  connect_timeout: float = 2.0, read_timeout: float = 15.0) -> None:
-        self.host, self.port, self.text = host, port, text
+        self.address, self.text = address, text
         self.voice, self.speaker, self.language = voice, speaker, language
         self.connect_timeout, self.read_timeout = connect_timeout, read_timeout
         self.format: Optional[PcmFormat] = None
@@ -99,7 +142,7 @@ class Synthesis:
 
     def open(self) -> None:
         """Connect and send the request. Raises OSError/WyomingError; no audio has been produced yet."""
-        sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
+        sock = self.address.connect(self.connect_timeout)
         sock.settimeout(self.read_timeout)
         self._sock = sock
         voice = {k: v for k, v in (("name", self.voice), ("speaker", self.speaker),
@@ -162,9 +205,9 @@ class Synthesis:
             sock.close()
 
 
-def describe(host: str, port: int, timeout: float = 5.0) -> dict:
+def describe(address: Address, timeout: float = 5.0) -> dict:
     """Return the server's ``info`` event data (voices, capabilities)."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    with address.connect(timeout) as sock:
         sock.settimeout(timeout)
         write_event(sock, "describe")
         rfile = sock.makefile("rb")
@@ -172,3 +215,13 @@ def describe(host: str, port: int, timeout: float = 5.0) -> dict:
             etype, data, _ = read_event(rfile)
             if etype == "info":
                 return data
+
+
+def tts_voice_names(info: dict) -> set[str]:
+    """Every voice name advertised by any TTS program in an ``info`` event."""
+    names: set[str] = set()
+    for program in info.get("tts") or []:
+        for voice in program.get("voices") or []:
+            if voice.get("name"):
+                names.add(str(voice["name"]))
+    return names

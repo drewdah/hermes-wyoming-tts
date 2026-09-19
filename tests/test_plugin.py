@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import socket
 import sys
 import threading
@@ -57,12 +58,19 @@ def _fake_ts(tts_config):
 class FakeServer:
     """mode: ok | stall | drop | error | inline (old-style inline data) | slow"""
 
-    def __init__(self, mode="ok", rate=24000, width=2, channels=1, chunks=5, chunk_samples=2400):
+    def __init__(self, mode="ok", rate=24000, width=2, channels=1, chunks=5, chunk_samples=2400,
+                 unix_path=None, voices=("kitt", "alba")):
         self.mode, self.rate, self.width, self.channels = mode, rate, width, channels
-        self.chunks, self.chunk_samples = chunks, chunk_samples
+        self.chunks, self.chunk_samples, self.voices = chunks, chunk_samples, voices
         self.requests = []
-        self.sock = socket.create_server(("127.0.0.1", 0))
-        self.port = self.sock.getsockname()[1]
+        if unix_path:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.bind(unix_path)
+            self.sock.listen()
+            self.port = None
+        else:
+            self.sock = socket.create_server(("127.0.0.1", 0))
+            self.port = self.sock.getsockname()[1]
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _send(self, conn, etype, data, payload=b""):
@@ -84,6 +92,10 @@ class FakeServer:
         with conn:
             etype, data, _ = protocol.read_event(conn.makefile("rb"))
             self.requests.append((etype, data))
+            if etype == "describe":
+                self._send(conn, "info", {"tts": [{"name": "fake", "voices": [
+                    {"name": v, "languages": ["en"]} for v in self.voices]}]})
+                return
             if self.mode == "error":
                 self._send(conn, "error", {"text": "voice not found"})
                 return
@@ -106,8 +118,9 @@ class FakeServer:
 
 
 def _streamer(port, **opts):
+    target = {"host": "127.0.0.1", "port": port} if port is not None else {}
     cfg = {"provider": "pocket_tts", "providers": {"pocket_tts": {"voice": "kitt"}},
-           "wyoming": {"host": "127.0.0.1", "port": port, "read_timeout": 1.0, **opts}}
+           "wyoming": {**target, "read_timeout": 1.0, "check_voice": False, **opts}}
     ts = _fake_ts(cfg)
     cls = plugin.build_streamer(ts)
     cls._down_until = 0.0
@@ -226,11 +239,97 @@ def test_resamples_mismatched_format():
     srv.close()
 
 
-def test_available_requires_host():
+def test_available_requires_host_or_uri():
     ts = _fake_ts({"wyoming": {}})
     assert plugin.build_streamer(ts).available() is False
     ts = _fake_ts({"wyoming": {"host": "x"}})
     assert plugin.build_streamer(ts).available() is True
+    ts = _fake_ts({"wyoming": {"uri": "unix:///run/piper.sock"}})
+    assert plugin.build_streamer(ts).available() is True
+    ts = _fake_ts({"wyoming": {"uri": "stdio://piper"}})  # unsupported scheme: inactive, not a crash
+    assert plugin.build_streamer(ts).available() is False
+
+
+def test_address_parsing():
+    A = protocol.Address
+    assert A.parse("tcp://10.0.0.5:10300") == A("tcp", host="10.0.0.5", port=10300)
+    assert A.parse("piper.lan:10200") == A("tcp", host="piper.lan", port=10200)
+    assert A.parse("piper.lan") == A("tcp", host="piper.lan", port=10200)
+    assert A.parse("unix:///run/piper.sock") == A("unix", path="/run/piper.sock")
+    assert str(A.parse("unix:///run/piper.sock")) == "unix:///run/piper.sock"
+    for bad in ("unix://", "stdio://x", "http://x:1"):
+        try:
+            A.parse(bad)
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError:
+            pass
+    # uri wins over host/port
+    opts = plugin.Options.from_config({}, {"uri": "tcp://a:1", "host": "b", "port": 2})
+    assert opts.address == A("tcp", host="a", port=1)
+
+
+def test_unix_socket_streams():
+    if not hasattr(socket, "AF_UNIX"):
+        print("  (skipped: no AF_UNIX on this platform)")
+        return
+    import tempfile
+    path = tempfile.mktemp(prefix="wyoming-test-", suffix=".sock")
+    srv = FakeServer(unix_path=path)
+    s = _streamer(None, uri=f"unix://{path}")
+    assert len(b"".join(s.stream("Over a unix socket."))) == 5 * 2400 * 2
+    assert srv.requests[0][1]["text"] == "Over a unix socket."
+    srv.close()
+    Path(path).unlink(missing_ok=True)
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _voice_check_logs(srv, voice):
+    plugin._voice_checks.clear()
+    cap = _Capture()
+    plugin.logger.addHandler(cap)
+    plugin.logger.setLevel(logging.INFO)
+    try:
+        opts = plugin.Options.from_config({}, {"host": "127.0.0.1", "port": srv.port, "voice": voice})
+        plugin.check_voice_once(opts, blocking=True)
+        plugin.check_voice_once(opts, blocking=True)  # second call must be a no-op
+    finally:
+        plugin.logger.removeHandler(cap)
+    return cap.records
+
+
+def test_voice_check_confirms_known_voice_once():
+    srv = FakeServer(voices=("kitt", "alba"))
+    recs = _voice_check_logs(srv, "kitt")
+    assert [r.levelno for r in recs] == [logging.INFO] and "confirmed" in recs[0].getMessage()
+    assert [e for e, _ in srv.requests] == ["describe"]  # only one describe for two calls
+    srv.close()
+
+
+def test_voice_check_warns_on_unknown_voice():
+    srv = FakeServer(voices=("kitt", "alba"))
+    recs = _voice_check_logs(srv, "kit")  # typo
+    assert len(recs) == 1 and recs[0].levelno == logging.WARNING
+    msg = recs[0].getMessage()
+    assert "'kit'" in msg and "alba, kitt" in msg
+    srv.close()
+
+
+def test_voice_check_retries_after_server_down():
+    dead = socket.create_server(("127.0.0.1", 0))
+    port = dead.getsockname()[1]
+    dead.close()
+    plugin._voice_checks.clear()
+    opts = plugin.Options.from_config({}, {"host": "127.0.0.1", "port": port, "voice": "kitt"})
+    plugin.check_voice_once(opts, blocking=True)
+    assert not plugin._voice_checks  # forgotten, so the next clause checks again
 
 
 def test_register_survives_missing_hermes_module():
